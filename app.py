@@ -1,3 +1,10 @@
+# app.py
+# Streamlit Cloud-ready: Synthetic F1 tire heat grid with vehicle + tire radius selectors
+# Fixes included:
+# - Clean astype(int) corner centers
+# - Seed widget max/value consistency (no StreamlitValueAboveMaxError)
+# - Cloud-safe caching + robust typing
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -60,6 +67,12 @@ def vehicle_param_bank(vehicles: List[str], seed: int) -> Dict[str, VehicleParam
 
 
 def simulate_track_dynamics(n_steps: int, seed: int, track_temp_c: float) -> pd.DataFrame:
+    """
+    Synthetic track dynamics:
+    - speed profile: sinusoids + noise
+    - braking spikes: gaussian pulses
+    - lat_g correlated with braking + mild oscillation
+    """
     rng = np.random.default_rng(seed + 202)
 
     t = np.arange(n_steps)
@@ -69,7 +82,7 @@ def simulate_track_dynamics(n_steps: int, seed: int, track_temp_c: float) -> pd.
     speed_kph = np.clip(base_speed + rng.normal(0, 6, size=n_steps), 70, 350)
 
     brake = np.zeros(n_steps, dtype=float)
-    # ✅ FIX: clean astype(int) (no broken tokens)
+    # ✅ FIX: clean astype(int)
     corner_centers = (np.linspace(0.08, 0.92, 8) * n_steps).astype(int)
 
     for c in corner_centers:
@@ -83,6 +96,7 @@ def simulate_track_dynamics(n_steps: int, seed: int, track_temp_c: float) -> pd.
     lat_g = 0.8 + 2.2 * brake + 0.35 * np.sin(2 * phase + 1.3) + rng.normal(0, 0.08, n_steps)
     lat_g = np.clip(lat_g, 0.2, 4.5)
 
+    # Track temp factor slightly shifts operating envelope
     track_factor = 1.0 + (track_temp_c - 35.0) * 0.004
 
     return pd.DataFrame(
@@ -104,6 +118,11 @@ def tire_targets(
     track_temp_c: float,
     track_dir_bias: float,
 ) -> Dict[str, np.ndarray]:
+    """
+    Compute per-tire target temperatures as a function of dynamics:
+      heat_in ~ k_speed*v^2 + k_brake*brake + k_latg*latg^1.15
+    with axle bias, left-right bias, and mild radius effect.
+    """
     v_ms = dyn["speed_kph"].to_numpy() / 3.6
     brake = dyn["brake"].to_numpy()
     lat_g = dyn["lat_g"].to_numpy()
@@ -119,11 +138,14 @@ def tire_targets(
     front_share = vp.front_bias
     rear_share = 1.0 - front_share
 
+    # Track direction bias: [-1..+1]; positive makes left a bit hotter
     left_share = 0.5 + 0.06 * track_dir_bias
     right_share = 1.0 - left_share
 
+    # Extra: braking heats fronts more; traction/speed heats rears slightly
     front_boost = 1.0 + 0.25 * brake
-    rear_boost = 1.0 + 0.18 * (v_ms / max(1e-9, float(v_ms.max())))
+    vmax = max(1e-9, float(v_ms.max()))
+    rear_boost = 1.0 + 0.18 * (v_ms / vmax)
 
     return {
         "FL": base + radius_peak * heat_in * front_share * left_share * front_boost,
@@ -133,7 +155,18 @@ def tire_targets(
     }
 
 
-def evolve_temperature(targets: Dict[str, np.ndarray], vp: VehicleParams, radius_m: float, seed: int, ambient_c: float):
+def evolve_temperature(
+    targets: Dict[str, np.ndarray],
+    vp: VehicleParams,
+    radius_m: float,
+    seed: int,
+    ambient_c: float,
+) -> Dict[str, np.ndarray]:
+    """
+    OU-like / AR(1)-like evolution:
+      T_{t+1} = T_t + k*(target - T_t) - cool*(T_t - ambient) + noise
+    Larger radius => higher inertia => slower response and slightly slower cooling.
+    """
     rng = np.random.default_rng(seed + 303)
 
     n = len(next(iter(targets.values())))
@@ -158,6 +191,9 @@ def evolve_temperature(targets: Dict[str, np.ndarray], vp: VehicleParams, radius
 
 
 def surface_from_core(core: Dict[str, np.ndarray], seed: int) -> Dict[str, Dict[str, np.ndarray]]:
+    """
+    Build 3-zone surface (Inner/Middle/Outer) from core temperature with mild gradients + noise.
+    """
     rng = np.random.default_rng(seed + 404)
     surf: Dict[str, Dict[str, np.ndarray]] = {}
 
@@ -185,11 +221,15 @@ def generate_data(
     ambient_c: float,
     track_temp_c: float,
 ) -> pd.DataFrame:
+    """
+    Long-form dataset:
+    vehicle, radius_m, lap, step_in_lap, global_step, tire, zone, temp_c + dynamics
+    """
     n_steps = n_laps * points_per_lap
     dyn = simulate_track_dynamics(n_steps=n_steps, seed=seed, track_temp_c=track_temp_c)
 
     bank = vehicle_param_bank(vehicles, seed=seed)
-    track_dir_bias = float(np.sin((radius_m - 0.305) * 12.0))  # mild deterministic bias
+    track_dir_bias = float(np.sin((radius_m - 0.305) * 12.0))  # deterministic mild bias
 
     frames = []
     global_step = np.arange(n_steps)
@@ -304,7 +344,16 @@ st.caption("Synthetic tire heat map generator (NOT real telemetry). Vehicles sha
 with st.sidebar:
     st.header("Controls")
 
-    seed = st.number_input("Random seed", min_value=0, max_value=10_000_000, value=20251227, step=1)
+    # ✅ FIX: max/value consistency (no StreamlitValueAboveMaxError)
+    DEFAULT_SEED = 20_251_227
+    MAX_SEED = 2_147_483_647  # safe 32-bit signed max
+    seed = st.number_input(
+        "Random seed",
+        min_value=0,
+        max_value=MAX_SEED,
+        value=min(DEFAULT_SEED, MAX_SEED),
+        step=1,
+    )
 
     vehicles = st.multiselect(
         "Vehicles (select one or more)",
@@ -357,6 +406,7 @@ df_all = generate_data(
 
 df = df_all[df_all["zone"] == zone].copy()
 
+# robust range to keep consistent color scaling across tiles
 zmin = float(df["temp_c"].quantile(0.02))
 zmax = float(df["temp_c"].quantile(0.98))
 
